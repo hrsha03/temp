@@ -1,0 +1,16 @@
+cd ut
+mkdir build && cd build
+
+cmake ..
+make -j$(nproc)
+
+# run all tests
+ctest --output-on-failure
+
+# coverage for one module
+gcov --object-directory CMakeFiles/test_fil.dir ../firmware/fil.c
+
+# html report
+lcov --capture --directory . --output-file coverage.info \
+     --filter branch
+genhtml coverage.info --output-directory coverage_report
