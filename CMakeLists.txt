@@ -1,76 +1,172 @@
-cmake_minimum_required(VERSION 3.14)
-project(firmware_ut C CXX)
+/**
+ * @file test_<module>.cpp
+ *
+ * Build:
+ *   g++ -o test_<module> test_<module>.cpp <module>.c [deps.c] \
+ *       -lgtest -lgtest_main -lpthread \
+ *       --coverage -fprofile-arcs -ftest-coverage \
+ *       -g -O0 -I.
+ */
 
-set(CMAKE_C_STANDARD 11)
-set(CMAKE_CXX_STANDARD 14)
+#include <gtest/gtest.h>
+#include <cstring>
+#include <cstdlib>
 
-# ── paths ────────────────────────────────────────────────
-set(FW  ${CMAKE_SOURCE_DIR}/../firmware)   # point at /firmware
-set(UT  ${CMAKE_SOURCE_DIR})               # /ut itself
+extern "C" {
+#include "<module>.h"
+#include "types.h"
+}
 
-# ── coverage flags ───────────────────────────────────────
-add_compile_options(--coverage -fprofile-arcs -ftest-coverage -g -O0)
-add_link_options(--coverage)
+/* =========================================================
+ * Mocks for external module dependencies
+ * Only mock what <module> calls — don't mock the module under test
+ * ========================================================= */
 
-# ── one interface target that carries all firmware headers ─
-# every test executable links this and gets all -I paths for free
-add_library(fw_headers INTERFACE)
-target_include_directories(fw_headers INTERFACE
-    ${FW}                  # fil.h, l2p.h, lbm.h ...
-    ${FW}/include          # types.h, config.h if in a subdir
-    ${UT}/mocks            # mock headers if any
-)
+/* Example: if <module> calls L2P_Read_NBA(), provide a stub */
+Block_t mock_block = {};
+Block_t *L2P_Read_NBA(MCA_t *mca) {
+    return &mock_block;
+}
 
-# ── fetch GTest automatically ────────────────────────────
-include(FetchContent)
-FetchContent_Declare(
-    googletest
-    URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
-)
-set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(googletest)
-include(GoogleTest)
-enable_testing()
+/* Example: if <module> calls LBM_UpdateBlockStatus() */
+void LBM_UpdateBlockStatus(MCA_t *mca) {
+    /* no-op stub — just absorb the call */
+}
 
-# ── macro: one call adds a complete test target ───────────
-#
-#   add_fw_test(
-#       NAME     test_fil
-#       SOURCES  test_fil.cpp ${FW}/fil.c
-#       MOCKS    mock_fcsim.c mock_l2p.c
-#   )
-#
-macro(add_fw_test)
-    cmake_parse_arguments(T "" "NAME" "SOURCES;MOCKS" ${ARGN})
+/* Add one stub per external function <module>.c calls
+ * Rule: if it's in another .c file and not under test, stub it */
 
-    # prefix mock paths with /ut/mocks/
-    set(_mock_srcs "")
-    foreach(m ${T_MOCKS})
-        list(APPEND _mock_srcs ${UT}/mocks/${m})
-    endforeach()
+/* =========================================================
+ * Test Fixture
+ *
+ * What goes in the class:
+ *   - Input objects the module functions take as parameters
+ *   - Shared global/extern state the module reads or writes
+ *   - Stubs/flags to control mock behaviour per test
+ *
+ * What does NOT go in the class:
+ *   - Output validation logic (that goes in each TEST_F)
+ *   - Unrelated module state
+ * ========================================================= */
+class MODULETest : public ::testing::Test {
+protected:
 
-    add_executable(${T_NAME} ${T_SOURCES} ${_mock_srcs})
+    /* --- Inputs --- */
+    MCA_t    mca;          /* or whatever the primary input struct is */
+    char     buffer[4096];
 
-    target_link_libraries(${T_NAME}
-        fw_headers          # all -I paths
-        gtest_main
-        pthread
-    )
+    /* --- Mock control flags --- */
+    /* These let individual tests change stub behaviour */
+    bool     mock_dep_should_fail = false;
+    uint8_t  mock_dep_return_val  = 0;
 
-    gtest_discover_tests(${T_NAME})
-endmacro()
+    /* --- SetUp: runs before EVERY test --- */
+    void SetUp() override {
+        /* 1. Reset all extern/global state the module touches */
+        memset(CMDQHead, 0, sizeof(CMDQHead));
+        memset(CMDQTail, 0, sizeof(CMDQTail));
 
-# ── register test targets ────────────────────────────────
-add_fw_test(
-    NAME    test_fil
-    SOURCES test_fil.cpp ${FW}/fil.c
-    MOCKS   mock_fcsim.c mock_l2p.c mock_lbm.c
-)
+        /* 2. Reset mock control flags to safe defaults */
+        mock_dep_should_fail = false;
+        mock_dep_return_val  = 0;
+        memset(&mock_block,  0, sizeof(mock_block));
 
-add_fw_test(
-    NAME    test_l2p
-    SOURCES test_l2p.cpp ${FW}/l2p.c
-    MOCKS   mock_lbm.c
-)
+        /* 3. Call the module's own Init — always, every test */
+        MODULE_Init();
 
-# add more modules here — one line each
+        /* 4. Set up a default valid input object */
+        mca.ch  = 0;
+        mca.bnk = 0;
+        memset(buffer, 0xAB, sizeof(buffer));
+    }
+
+    /* --- TearDown: runs after EVERY test --- */
+    void TearDown() override {
+        /* Free anything the module allocates internally
+         * that you have a handle to */
+    }
+
+    /* --- Helpers --- shared logic used across multiple tests --- */
+
+    /* Drive the module into a known "ready" state */
+    void DriveToReadyState() {
+        MODULE_Init();
+        /* any extra setup needed before operation functions work */
+    }
+
+    /* Drive the module into a full/error state */
+    void FillQueue(uint8_t ch, uint8_t bk) {
+        CMDQTail[ch][bk] = 3;
+        CMDQHead[ch][bk] = 0;
+    }
+};
+
+/* =========================================================
+ * Group 1 — Init tests
+ * Rule: test Init in isolation, no operation functions here
+ * ========================================================= */
+TEST_F(MODULETest, Init_ResetsStateToKnownGood) {
+    /* corrupt state first, then re-init, then verify */
+    CMDQHead[0][0] = 0xFF;
+    MODULE_Init();
+    EXPECT_EQ(CMDQHead[0][0], 0);
+}
+
+TEST_F(MODULETest, Init_IdempotentOnMultipleCalls) {
+    MODULE_Init();
+    MODULE_Init();
+    EXPECT_EQ(CMDQHead[0][0], 0);   /* should be safe to call twice */
+}
+
+/* =========================================================
+ * Group 2 — Operation function: happy path
+ * Rule: one behaviour per test, use the most minimal setup
+ * ========================================================= */
+TEST_F(MODULETest, OperationFn_ReturnsTrue_OnSuccess) {
+    bool_t result = MODULE_OperationFn(&mca, buffer);
+    EXPECT_EQ(result, TRUE);
+}
+
+TEST_F(MODULETest, OperationFn_UpdatesStateCorrectly) {
+    MODULE_OperationFn(&mca, buffer);
+    EXPECT_EQ(some_global_state, expected_value);
+}
+
+/* =========================================================
+ * Group 3 — Operation function: error/boundary paths
+ * These are the paths gcov will flag as uncovered if missed
+ * ========================================================= */
+TEST_F(MODULETest, OperationFn_ReturnsFalse_WhenQueueFull) {
+    FillQueue(0, 0);
+    EXPECT_EQ(MODULE_OperationFn(&mca, buffer), FALSE);
+}
+
+TEST_F(MODULETest, OperationFn_HandlesNullInput_Gracefully) {
+    EXPECT_EQ(MODULE_OperationFn(NULL, buffer), FALSE);
+}
+
+TEST_F(MODULETest, OperationFn_BoundaryValue_MaxChannel) {
+    mca.ch = MAX_CHANNEL - 1;
+    EXPECT_EQ(MODULE_OperationFn(&mca, buffer), TRUE);
+}
+
+/* =========================================================
+ * Group 4 — Multi-instance / isolation
+ * Verify one channel/bank doesn't bleed into another
+ * ========================================================= */
+TEST_F(MODULETest, OperationFn_DoesNotAffectOtherChannels) {
+    mca.ch = 1; mca.bnk = 2;
+    MODULE_OperationFn(&mca, buffer);
+
+    EXPECT_EQ(CMDQTail[0][0], 0);   /* ch0/bk0 must be untouched */
+    EXPECT_EQ(CMDQTail[1][2], 1);   /* only ch1/bk2 changed */
+}
+
+/* =========================================================
+ * Group 5 — Dependency interaction
+ * Verify the module reacts correctly to what mocks return
+ * ========================================================= */
+TEST_F(MODULETest, OperationFn_HandlesDepFailure) {
+    mock_dep_should_fail = true;
+    EXPECT_EQ(MODULE_OperationFn(&mca, buffer), FALSE);
+}
